@@ -1,8 +1,9 @@
 import google.generativeai as genai
 import psycopg2
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
+from pydantic import BaseModel
 
 # Configure Gemini API
 GENAI_API_KEY = "AIzaSyD12Yk5ynGFAII5GV5nDFE80aVeoHoQ884"
@@ -28,18 +29,13 @@ app.add_middleware(
 async def get_db_connection():
     return await asyncpg.connect(DB_URL)
 
-# Agent 1: Fetch Questions from Gemini API
+# Agent 1: Fetch Questions from Gemini AI
 def fetch_questions(topic):
     model = genai.GenerativeModel("gemini-1.5-pro")
     prompt = f"Generate 500 unique interview questions for a software engineer with 7 years of experience in {topic}. Only provide questions, no numbering, no topics."
 
     response = model.generate_content(prompt)
-
-    if hasattr(response, "text"):
-        questions = response.text.split("\n")
-    else:
-        questions = []
-
+    questions = response.text.split("\n") if hasattr(response, "text") else []
     return [q.strip() for q in questions if q.strip()]  # Remove empty lines
 
 # Agent 2: Check for Duplicate Questions in NeonDB
@@ -48,40 +44,30 @@ def check_duplicates(questions):
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
         cur.execute("SELECT question FROM questions")
-        existing_questions = set(q[0] for q in cur.fetchall())  # Fetch all existing questions in a set
+        existing_questions = set(q[0] for q in cur.fetchall())
         cur.close()
         conn.close()
 
-        unique_questions = [q for q in questions if q not in existing_questions]  # Filter new questions
-        print(f"Found {len(existing_questions)} existing questions. {len(unique_questions)} new questions to insert.")  # Debugging
+        unique_questions = [q for q in questions if q not in existing_questions]
         return unique_questions
-
     except Exception as e:
         print(f"Error checking duplicates: {e}")
         return []
 
 # Agent 3: Bulk Insert Unique Questions into NeonDB
-# Agent 3: Bulk Insert Unique Questions into NeonDB
 def bulk_insert_questions(questions, topic):
     if not questions:
-        print("No new questions to insert.")
         return []
 
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-
-        # Include topic in the insert query
         values = [(q, topic) for q in questions]
         cur.executemany("INSERT INTO questions (question, topic) VALUES (%s, %s) ON CONFLICT DO NOTHING", values)
-
         conn.commit()
         cur.close()
         conn.close()
-
-        print(f"Inserted {len(questions)} questions for topic '{topic}' successfully.")
-        return questions  # Return the inserted questions
-
+        return questions
     except Exception as e:
         print(f"Error in bulk insert: {e}")
         return []
@@ -89,8 +75,8 @@ def bulk_insert_questions(questions, topic):
 # Orchestrator: Fetch, Filter, and Store Questions
 def process_questions(topic):
     questions = fetch_questions(topic)
-    unique_questions = check_duplicates(questions)  # Filter out duplicates
-    inserted_questions = bulk_insert_questions(unique_questions, topic)  # Insert with topic
+    unique_questions = check_duplicates(questions)
+    inserted_questions = bulk_insert_questions(unique_questions, topic)
     return inserted_questions
 
 @app.get("/api/topics")
@@ -98,8 +84,8 @@ async def get_topics():
     """Fetch all topics from the database."""
     conn = await get_db_connection()
     try:
-        topics = await conn.fetch("SELECT DISTINCT topic FROM questions")  # Fetch unique topics
-        return [{"name": t["topic"]} for t in topics]  # Returning only topic names
+        topics = await conn.fetch("SELECT DISTINCT topic FROM questions")
+        return [{"name": t["topic"]} for t in topics]
     finally:
         await conn.close()
 
@@ -112,6 +98,60 @@ async def get_questions(topic: str):
         return [{"id": q["id"], "text": q["question"]} for q in questions]
     finally:
         await conn.close()
+
+# Agent 4: Check if Answer Exists
+def get_stored_answer(question_id):
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT answer FROM answers WHERE question_id = %s", (question_id,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return result[0] if result else None
+    except Exception as e:
+        print(f"Error fetching answer: {e}")
+        return None
+
+# Agent 5: Generate Answer from Gemini AI
+def generate_answer(question_text):
+    try:
+        model = genai.GenerativeModel("gemini-1.5-pro")
+        prompt = f"Answer this interview question precisely: {question_text}"
+        response = model.generate_content(prompt)
+        return response.text.strip() if hasattr(response, "text") else "No answer generated."
+    except Exception as e:
+        print(f"Error generating answer: {e}")
+        return "Error generating answer."
+
+# Agent 6: Store Answer in PostgreSQL
+def store_answer(question_id, answer):
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO answers (question_id, answer) VALUES (%s, %s)", (question_id, answer))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error storing answer: {e}")
+
+class AnswerRequest(BaseModel):
+    question_id: int
+    question_text: str
+
+@app.post("/api/get-answer/")
+def fetch_answer(request: AnswerRequest):
+    """Fetch an answer from DB or generate a new one."""
+    stored_answer = get_stored_answer(request.question_id)
+
+    if stored_answer:
+        return {"answer": stored_answer}
+
+    # If no answer exists, generate and store it
+    new_answer = generate_answer(request.question_text)
+    store_answer(request.question_id, new_answer)
+    return {"answer": new_answer}
 
 # API Endpoint to trigger the agent system with a topic
 @app.get("/fetch-questions/{topic}")
