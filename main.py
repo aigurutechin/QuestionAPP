@@ -32,7 +32,13 @@ async def get_db_connection():
 # Agent 1: Fetch Questions from Gemini AI
 def fetch_questions(topic):
     model = genai.GenerativeModel("gemini-1.5-pro")
-    prompt = f"Generate 500 unique interview questions for a software engineer with 7 years of experience in {topic}. Only provide questions, no numbering, no topics."
+    prompt = (
+        f"Generate 500 unique technical interview questions for a software engineer "
+        f"with 7 years of experience in {topic}. "
+        f"Only include technical coding, system design, algorithms, and software engineering concepts. "
+        f"Exclude behavioral, HR, and non-technical questions. "
+        f"Do not add numbering, topics, or explanations—only the raw questions."
+    )
 
     response = model.generate_content(prompt)
     questions = response.text.split("\n") if hasattr(response, "text") else []
